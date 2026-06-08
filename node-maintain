@@ -1,0 +1,944 @@
+#!/usr/bin/env zsh
+set -euo pipefail
+
+# node-maintain.zsh
+# Safe Node.js/nvm maintenance for zsh.
+#
+# Features:
+# - Installs latest LTS Node via nvm
+# - Updates each installed major line to its latest release
+# - Migrates global npm packages from default
+# - Updates global npm packages
+# - Checks deprecated global packages
+# - Reviews installed Node versions
+# - Suggests removable old versions
+# - Prompts before executing nvm uninstall commands
+
+NVM_DIR="${NVM_DIR:-$HOME/.nvm}"
+WORKSPACE_ROOT="${WORKSPACE_ROOT:-$HOME/workspace}"
+SCRIPT_PATH="${0:A}"
+LOG_DIR="$HOME/workspace/logs/node-maintain"
+RUN_STAMP="$(date '+%Y_%m_%d-%H_%M_%S')"
+INFO_LOG="$LOG_DIR/node_maintain-$RUN_STAMP.txt"
+DETAIL_LOG="$LOG_DIR/node_maintain-$RUN_STAMP-details.txt"
+LATEST_LTS_FILE=""
+LATEST_LTS_VERSION=""
+INSTALL_ACTIONS_FILE=""
+MAJOR_UPDATE_COMMANDS_FILE=""
+
+###############################################################################
+# Logging and output helpers
+###############################################################################
+
+setup_logs() {
+  # Keep the log directory private because command output can include local paths
+  # and npm configuration details.
+  mkdir -p "$LOG_DIR"
+  chmod 700 "$LOG_DIR"
+
+  : >| "$INFO_LOG"
+  : >| "$DETAIL_LOG"
+  chmod 600 "$INFO_LOG" "$DETAIL_LOG"
+
+  # Mirror all normal terminal output into the detail log. The script remains
+  # visible when run interactively, while stdout/stderr are captured for review.
+  exec > >(tee -a "$DETAIL_LOG")
+  exec 2> >(tee -a "$DETAIL_LOG" >&2)
+}
+
+log_info() {
+  print -r -- "$*" >> "$INFO_LOG"
+}
+
+info() {
+  # High-level milestones are shown in the terminal, stored in the detail log
+  # through tee, and also stored in the concise info log.
+  print
+  print -- "==> $*"
+  log_info ""
+  log_info "==> $*"
+}
+
+warn() {
+  print -u2 -- "WARNING: $*"
+  log_info "WARNING: $*"
+}
+
+die() {
+  print -u2 -- "ERROR: $*"
+  log_info "ERROR: $*"
+  log_info "Detail log: $DETAIL_LOG"
+  exit 1
+}
+
+log_command() {
+  # Commands can be shell functions such as nvm, so this logs the reviewable
+  # command string without trying to reconstruct shell quoting automatically.
+  log_info "+ $*"
+}
+
+run_cmd() {
+  local label="$1"
+  shift
+
+  log_command "$label"
+  "$@"
+}
+
+run_cmd_allow_failure() {
+  local label="$1"
+  local rc=0
+  shift
+
+  # Some maintenance checks are informational and use non-zero status for
+  # ordinary states, such as "no outdated packages". Keep those visible without
+  # allowing them to interrupt the whole run.
+  log_command "$label"
+  "$@" || rc=$?
+
+  if (( rc != 0 )); then
+    warn "Command exited with status $rc: $label"
+  fi
+
+  return 0
+}
+
+is_semver() {
+  [[ "$1" =~ '^v?[0-9]+\.[0-9]+\.[0-9]+$' ]]
+}
+
+normalize_semver() {
+  print -r -- "${1#v}"
+}
+
+warn_if_old_nvm() {
+  local version="$1"
+  local major=0
+  local minor=0
+  local -a parts
+
+  # Older nvm releases can fail to resolve modern Node aliases like lts/*.
+  # Warn early so later N/A diagnostics make sense to the person reviewing logs.
+  if [[ "$version" =~ '^([0-9]+)\.([0-9]+)\.([0-9]+)$' ]]; then
+    parts=("${(@s:.:)version}")
+    major="${parts[1]}"
+    minor="${parts[2]}"
+
+    if (( major == 0 && minor < 39 )); then
+      warn "nvm $version is old; remote aliases such as lts/* may not resolve reliably."
+      warn "Consider updating nvm outside this script, then rerun node-maintain."
+    fi
+  fi
+}
+
+print_config() {
+  # Print the startup context first so a short or failed run still leaves a
+  # useful record of which nvm directory and workspace were used.
+  info "Runtime configuration"
+  print "Script: $SCRIPT_PATH"
+  print "Started: $(date)"
+  print "User: ${USER:-unknown}"
+  print "Shell: ${SHELL:-unknown}"
+  print "HOME: $HOME"
+  print "NVM_DIR: $NVM_DIR"
+  print "WORKSPACE_ROOT: $WORKSPACE_ROOT"
+  print "Info log: $INFO_LOG"
+  print "Detail log: $DETAIL_LOG"
+
+  log_info "Script: $SCRIPT_PATH"
+  log_info "Started: $(date)"
+  log_info "User: ${USER:-unknown}"
+  log_info "Shell: ${SHELL:-unknown}"
+  log_info "HOME: $HOME"
+  log_info "NVM_DIR: $NVM_DIR"
+  log_info "WORKSPACE_ROOT: $WORKSPACE_ROOT"
+  log_info "Info log: $INFO_LOG"
+  log_info "Detail log: $DETAIL_LOG"
+}
+
+load_nvm() {
+  local source_rc=0
+
+  [[ -s "$NVM_DIR/nvm.sh" ]] || die "nvm.sh not found at: $NVM_DIR/nvm.sh"
+
+  log_command "source $NVM_DIR/nvm.sh --no-use"
+
+  # --no-use prevents nvm from auto-selecting a broken default alias such as
+  # "default -> lts/* (-> N/A)" while the script is still starting up.
+  set +e
+  set +u
+  source "$NVM_DIR/nvm.sh" --no-use || source_rc=$?
+  set -u
+  set -e
+
+  if (( source_rc != 0 )); then
+    warn "nvm.sh returned status $source_rc while loading; continuing only if nvm is available."
+  fi
+
+  command -v nvm >/dev/null 2>&1 || die "nvm is unavailable after sourcing $NVM_DIR/nvm.sh"
+}
+
+explain_nvm_na_state() {
+  local default_version=""
+  local remote_lts=""
+
+  # N/A from nvm is ambiguous: it may mean "not installed", "remote aliases are
+  # unavailable", or "this nvm version cannot parse the current release index".
+  # Capture the exact alias state before changing anything.
+  info "nvm alias and remote checks"
+  run_cmd_allow_failure "nvm alias default" nvm alias default
+
+  log_command "nvm version default"
+  default_version="$(nvm version default 2>/dev/null || true)"
+  print "default version resolution: $default_version"
+
+  log_command "nvm version-remote 'lts/*'"
+  remote_lts="$(nvm version-remote 'lts/*' 2>/dev/null || true)"
+  print "remote lts/* resolution: $remote_lts"
+
+  if [[ "$default_version" == "N/A" ]]; then
+    warn "The default nvm alias does not resolve to an installed Node version."
+    warn "Common causes: lts/* is not installed yet, nvm cannot resolve remote LTS metadata, or an old nvm release cannot parse the current Node release index."
+  fi
+
+  if [[ "$remote_lts" == "N/A" ]]; then
+    warn "nvm cannot resolve the remote lts/* alias in this shell."
+    warn "The script will resolve latest LTS from nodejs.org index.json and install that exact version instead of running 'nvm install lts/*'."
+  fi
+}
+
+resolve_latest_lts_version() {
+  LATEST_LTS_FILE="$(mktemp)"
+  local latest_version=""
+
+  # Do not trust nvm's lts/* alias in environments where it resolves to N/A.
+  # The Node release index is the source of truth; install exact versions from it
+  # so the rest of the script is deterministic.
+  info "Resolving latest Node LTS version"
+  log_command "curl -fsSL https://nodejs.org/dist/index.json -o $LATEST_LTS_FILE"
+
+  curl -fsSL https://nodejs.org/dist/index.json -o "$LATEST_LTS_FILE" ||
+    die "Could not fetch https://nodejs.org/dist/index.json; cannot safely resolve latest LTS."
+
+  log_command "awk/sort latest LTS from $LATEST_LTS_FILE"
+  latest_version="$(
+    awk -F'"' '
+      /"version"[[:space:]]*:[[:space:]]*"v[0-9]+\.[0-9]+\.[0-9]+"/ && /"lts"[[:space:]]*:/ && !/"lts"[[:space:]]*:[[:space:]]*false/ {
+        for (i = 1; i <= NF; i++) {
+          if ($i == "version") {
+            print $(i + 2)
+            break
+          }
+        }
+      }
+    ' "$LATEST_LTS_FILE" \
+      | sed 's/^v//' \
+      | sort -t. -k1,1n -k2,2n -k3,3n \
+      | tail -n 1
+  )"
+
+  [[ -n "$latest_version" ]] && latest_version="v$latest_version"
+
+  [[ "$latest_version" == v* ]] || die "Could not determine latest LTS from Node release index."
+
+  LATEST_LTS_VERSION="$latest_version"
+  print "Latest official Node LTS: $LATEST_LTS_VERSION"
+  log_info "Latest official Node LTS: $LATEST_LTS_VERSION"
+}
+
+major_of_version() {
+  local normalized=""
+
+  normalized="$(normalize_semver "$1")"
+  print -r -- "${normalized%%.*}"
+}
+
+version_installed() {
+  local wanted=""
+
+  wanted="$(normalize_semver "$1")"
+  installed_versions_raw | grep -qx "$wanted"
+}
+
+same_version() {
+  [[ "$(normalize_semver "$1")" == "$(normalize_semver "$2")" ]]
+}
+
+installed_versions_raw() {
+  # nvm ls may print aliases and may return non-zero when aliases are broken.
+  # Pull only concrete installed semver entries and ignore the alias noise.
+  (nvm ls --no-colors 2>/dev/null || true) \
+    | sed -nE 's/.*v([0-9]+\.[0-9]+\.[0-9]+).*/\1/p' \
+    | sort -Vu
+}
+
+latest_installed_same_major() {
+  local target_major=""
+
+  target_major="$(major_of_version "$1")"
+
+  installed_versions_raw \
+    | awk -F. -v major="$target_major" '$1 == major { latest = $0 } END { if (latest) print latest }'
+}
+
+nearest_lower_major_source() {
+  local target_major=""
+
+  target_major="$(major_of_version "$1")"
+
+  installed_versions_raw \
+    | awk -F. -v major="$target_major" '$1 < major { source = $0 } END { if (source) print source }'
+}
+
+migration_source_for_target() {
+  local target_version=""
+  local source_version=""
+
+  target_version="$(normalize_semver "$1")"
+
+  if version_installed "$target_version"; then
+    return 1
+  fi
+
+  # Minor/patch upgrades should copy packages from the latest installed version
+  # in the same major. A brand-new major has no same-major source, so copy from
+  # the nearest lower major available.
+  source_version="$(latest_installed_same_major "$target_version")"
+
+  if [[ -z "$source_version" ]]; then
+    source_version="$(nearest_lower_major_source "$target_version")"
+  fi
+
+  [[ -n "$source_version" ]] || return 1
+  print -r -- "$source_version"
+}
+
+add_install_action() {
+  local target_version="$1"
+  local source_version="$2"
+  local reason="$3"
+
+  [[ -n "$INSTALL_ACTIONS_FILE" ]] || die "install action file is not initialized"
+  is_semver "$target_version" || die "refusing invalid install target: $target_version"
+
+  if [[ "$source_version" != "-" ]]; then
+    is_semver "$source_version" || die "refusing invalid migration source: $source_version"
+  fi
+
+  if awk -F'\t' -v target="${target_version#v}" '$1 == target { found = 1 } END { exit found ? 0 : 1 }' "$INSTALL_ACTIONS_FILE"; then
+    print "Skipping duplicate install action for v${target_version#v}."
+    return 0
+  fi
+
+  print -r -- "${target_version#v}	${source_version#v}	$reason" >> "$INSTALL_ACTIONS_FILE"
+}
+
+plan_latest_lts_install() {
+  local source_version=""
+
+  info "Planning latest LTS install action"
+
+  if version_installed "$LATEST_LTS_VERSION"; then
+    print "Latest LTS $LATEST_LTS_VERSION is already installed; no install action needed."
+    log_info "Latest LTS $LATEST_LTS_VERSION already installed; no install action needed."
+    return 0
+  fi
+
+  source_version="$(migration_source_for_target "$LATEST_LTS_VERSION" || true)"
+
+  if [[ -n "$source_version" ]]; then
+    add_install_action "$LATEST_LTS_VERSION" "$source_version" "Install latest LTS and migrate global packages from v${source_version#v}"
+  else
+    warn "No installed nvm-managed migration source found; latest LTS will be installed without package migration."
+    add_install_action "$LATEST_LTS_VERSION" "-" "Ensure latest LTS is installed and npm is current"
+  fi
+}
+
+plan_installed_major_versions() {
+  local versions_raw=""
+
+  # For each installed major line, keep that line alive by installing the latest
+  # official release in the same major and copying global packages from the
+  # latest currently installed version for that major.
+  versions_raw="$(installed_versions_raw)"
+  MAJOR_UPDATE_COMMANDS_FILE="$(mktemp)"
+
+  info "Planning latest release for each installed Node major"
+
+  if [[ -z "$versions_raw" ]]; then
+    warn "No nvm-managed Node versions detected; skipping major-version updates."
+    : > "$MAJOR_UPDATE_COMMANDS_FILE"
+    return 0
+  fi
+
+  log_command "node - $LATEST_LTS_FILE <installed-versions> $MAJOR_UPDATE_COMMANDS_FILE <<'NODE'"
+  node - "$LATEST_LTS_FILE" "$versions_raw" "$MAJOR_UPDATE_COMMANDS_FILE" <<'NODE'
+const fs = require('fs');
+
+const [indexFile, versionsRaw, updateFile] = process.argv.slice(2);
+
+function parseVersion(value) {
+  const match = String(value).trim().replace(/^v/, '').match(/^(\d+)\.(\d+)\.(\d+)$/);
+  if (!match) return null;
+  return {
+    raw: `${match[1]}.${match[2]}.${match[3]}`,
+    major: Number(match[1]),
+    minor: Number(match[2]),
+    patch: Number(match[3])
+  };
+}
+
+function compare(a, b) {
+  return a.major - b.major || a.minor - b.minor || a.patch - b.patch;
+}
+
+let releases = [];
+try {
+  releases = JSON.parse(fs.readFileSync(indexFile, 'utf8'));
+} catch {
+  releases = [];
+}
+
+const latestAvailableByMajor = new Map();
+
+for (const release of releases) {
+  const parsed = parseVersion(release.version);
+  if (!parsed) continue;
+
+  const existing = latestAvailableByMajor.get(parsed.major);
+  if (!existing || compare(parsed, existing) > 0) {
+    latestAvailableByMajor.set(parsed.major, parsed);
+  }
+}
+
+const latestInstalledByMajor = new Map();
+
+for (const installed of versionsRaw.split(/\s+/).map(parseVersion).filter(Boolean)) {
+  const existing = latestInstalledByMajor.get(installed.major);
+  if (!existing || compare(installed, existing) > 0) {
+    latestInstalledByMajor.set(installed.major, installed);
+  }
+}
+
+const updates = [];
+
+for (const [major, source] of [...latestInstalledByMajor.entries()].sort((a, b) => a[0] - b[0])) {
+  const target = latestAvailableByMajor.get(major);
+
+  if (!target) {
+    console.log(`No official release-index entry found for Node ${major}; skipping.`);
+    continue;
+  }
+
+  if (compare(target, source) <= 0) {
+    console.log(`Node ${major}: already at latest installed release v${source.raw}.`);
+    continue;
+  }
+
+  console.log(`Node ${major}: update v${source.raw} -> v${target.raw}`);
+  console.log(`  Package migration source: v${source.raw}`);
+  updates.push(`${source.raw}\t${target.raw}`);
+}
+
+fs.writeFileSync(updateFile, updates.join('\n') + (updates.length ? '\n' : ''));
+NODE
+
+  if [[ ! -s "$MAJOR_UPDATE_COMMANDS_FILE" ]]; then
+    print "No installed major lines need updates."
+    return 0
+  fi
+
+  while IFS=$'\t' read -r source_version target_version; do
+    [[ -n "$source_version" && -n "$target_version" ]] || continue
+
+    if ! is_semver "$source_version" || ! is_semver "$target_version"; then
+      die "refusing unexpected major update action: $source_version -> $target_version"
+    fi
+
+    if same_version "$source_version" "$target_version"; then
+      print "Skipping Node ${target_version%%.*}: source and target are both v$target_version."
+      continue
+    fi
+
+    add_install_action "$target_version" "$source_version" "Update Node ${target_version%%.*} to latest release and migrate global packages from v$source_version"
+  done < "$MAJOR_UPDATE_COMMANDS_FILE"
+}
+
+show_install_actions() {
+  local target_version=""
+  local source_version=""
+  local reason=""
+  local count=0
+
+  info "Install actions to execute if confirmed"
+
+  if [[ ! -s "$INSTALL_ACTIONS_FILE" ]]; then
+    print "No install actions generated."
+    return 0
+  fi
+
+  while IFS=$'\t' read -r target_version source_version reason; do
+    [[ -n "$source_version" && -n "$target_version" ]] || continue
+
+    (( count += 1 ))
+    print "$count. $reason"
+
+    if [[ "$source_version" == "-" ]]; then
+      print "   Command: nvm install $target_version --latest-npm"
+    else
+      print "   Command: nvm install $target_version --reinstall-packages-from=$source_version --latest-npm"
+    fi
+  done < "$INSTALL_ACTIONS_FILE"
+}
+
+show_followup_actions() {
+  info "Follow-up actions after confirmed installs"
+  print "1. Set nvm default to latest LTS when that version is installed."
+  print "2. Use the selected default Node and show active node/npm versions."
+  print "3. Check outdated global npm packages, run npm update -g, run npm doctor, and report deprecated global packages."
+  print "4. Build a separate uninstall plan that keeps only the latest installed version for each Node major."
+  print "5. Ask for uninstall confirmation before removing any Node versions."
+}
+
+execute_install_actions() {
+  local target_version=""
+  local source_version=""
+  local reason=""
+
+  if [[ ! -s "$INSTALL_ACTIONS_FILE" ]]; then
+    return 0
+  fi
+
+  info "Executing confirmed install actions"
+
+  while IFS=$'\t' read -r target_version source_version reason; do
+    [[ -n "$source_version" && -n "$target_version" ]] || continue
+
+    is_semver "$target_version" || die "refusing invalid install target: $target_version"
+
+    if [[ "$source_version" == "-" ]] || same_version "$source_version" "$target_version"; then
+      run_cmd "nvm install $target_version --latest-npm" \
+        nvm install "$target_version" --latest-npm
+    else
+      is_semver "$source_version" || die "refusing invalid migration source: $source_version"
+      run_cmd "nvm install $target_version --reinstall-packages-from=$source_version --latest-npm" \
+        nvm install "$target_version" "--reinstall-packages-from=$source_version" --latest-npm
+    fi
+  done < "$INSTALL_ACTIONS_FILE"
+}
+
+confirm_action() {
+  local prompt="$1"
+  local reply=""
+
+  print
+  print -n "$prompt [y/N] "
+  read -r reply
+
+  [[ "$reply" == [yY] || "$reply" == [yY][eE][sS] ]]
+}
+
+need_cmd() {
+  if ! command -v "$1" >/dev/null 2>&1; then
+    die "required command not found: $1"
+  fi
+}
+
+cleanup_file() {
+  local file="$1"
+  local resolved_file=""
+
+  # All cleanup targets should be mktemp files. Refuse to remove anything that
+  # resolves outside macOS temporary directories.
+  [[ -n "$file" && -f "$file" ]] || return 0
+
+  resolved_file="${file:A}"
+
+  case "$resolved_file" in
+    /tmp/*|/private/tmp/*|/var/folders/*/*/T/*|/private/var/folders/*/*/T/*)
+      ;;
+    *)
+      die "refusing to remove non-temporary file: $resolved_file"
+      ;;
+  esac
+
+  rm -f "$file"
+}
+
+setup_logs
+print_config
+load_nvm
+need_cmd curl
+
+###############################################################################
+# Maintenance flow
+###############################################################################
+
+info "nvm environment"
+run_cmd "nvm --version" nvm --version
+warn_if_old_nvm "$(nvm --version 2>/dev/null || true)"
+run_cmd_allow_failure "nvm current" nvm current
+explain_nvm_na_state
+
+info "Installed Node versions before maintenance"
+run_cmd_allow_failure "nvm ls" nvm ls
+
+info "Current active Node/npm"
+run_cmd_allow_failure "node -v" node -v
+run_cmd_allow_failure "npm -v" npm -v
+
+info "Current global npm packages"
+run_cmd_allow_failure "npm -g ls --depth=0" npm -g ls --depth=0
+
+resolve_latest_lts_version
+INSTALL_ACTIONS_FILE="$(mktemp)"
+
+###############################################################################
+# Plan, confirm, and execute Node install actions
+###############################################################################
+
+plan_latest_lts_install
+plan_installed_major_versions
+show_install_actions
+show_followup_actions
+
+if [[ -s "$INSTALL_ACTIONS_FILE" ]]; then
+  if confirm_action "Execute these Node install/update actions now?"; then
+    execute_install_actions
+  else
+    print "Skipped install/update actions."
+  fi
+else
+  print "No install/update actions to execute."
+fi
+
+info "Setting default Node to latest LTS"
+if version_installed "$LATEST_LTS_VERSION"; then
+  run_cmd "nvm alias default $LATEST_LTS_VERSION" nvm alias default "$LATEST_LTS_VERSION"
+  run_cmd "nvm use $LATEST_LTS_VERSION" nvm use "$LATEST_LTS_VERSION"
+else
+  warn "Latest LTS $LATEST_LTS_VERSION is not installed; leaving the active Node unchanged."
+fi
+
+need_cmd node
+need_cmd npm
+
+info "Active Node/npm after update"
+run_cmd "node -v" node -v
+run_cmd "npm -v" npm -v
+
+###############################################################################
+# Maintain npm packages on the active default LTS
+###############################################################################
+
+info "Checking outdated global packages"
+run_cmd_allow_failure "npm outdated -g --depth=0" npm outdated -g --depth=0
+
+info "Updating global packages"
+run_cmd "npm update -g" npm update -g
+
+info "Running npm doctor"
+run_cmd_allow_failure "npm doctor" npm doctor
+
+info "Checking deprecated global packages"
+GLOBAL_JSON="$(mktemp)"
+log_command "npm -g ls --depth=0 --json > $GLOBAL_JSON"
+npm -g ls --depth=0 --json > "$GLOBAL_JSON" || warn "Could not list global packages as JSON."
+
+log_command "node - $GLOBAL_JSON <<'NODE'"
+node - "$GLOBAL_JSON" <<'NODE'
+const fs = require('fs');
+const { execFileSync } = require('child_process');
+
+const file = process.argv[2];
+let data = {};
+
+try {
+  data = JSON.parse(fs.readFileSync(file, 'utf8'));
+} catch {
+  process.exit(0);
+}
+
+const deps = data.dependencies || {};
+const names = Object.keys(deps).filter(name => name !== 'npm');
+
+if (!names.length) {
+  console.log("No global packages detected.");
+  process.exit(0);
+}
+
+let found = false;
+
+for (const name of names) {
+  try {
+    const out = execFileSync(
+      'npm',
+      ['view', name, 'deprecated', '--json'],
+      { encoding: 'utf8', stdio: ['ignore', 'pipe', 'ignore'] }
+    ).trim();
+
+    if (out && out !== 'null' && out !== '""') {
+      found = true;
+      console.log(`Deprecated global package: ${name}`);
+      console.log(`  Reason: ${out}`);
+      console.log(`  Review command: npm uninstall -g ${name}`);
+    }
+  } catch {
+    // Package may be private, removed, or temporarily unavailable.
+  }
+}
+
+if (!found) {
+  console.log("No deprecated global packages detected.");
+}
+NODE
+
+cleanup_file "$GLOBAL_JSON"
+
+###############################################################################
+# Suggest old installed versions for removal
+###############################################################################
+
+info "Installed Node versions after maintenance"
+run_cmd_allow_failure "nvm ls" nvm ls
+
+CURRENT_VERSION="$(node -v | sed 's/^v//')"
+DEFAULT_VERSION="$(nvm version default 2>/dev/null || true)"
+DEFAULT_VERSION="$(normalize_semver "$DEFAULT_VERSION")"
+
+VERSIONS_RAW="$(
+  installed_versions_raw
+)"
+
+print
+print "Current version: v$CURRENT_VERSION"
+print "Default version: v$DEFAULT_VERSION"
+log_info "Current version: v$CURRENT_VERSION"
+log_info "Default version: v$DEFAULT_VERSION"
+
+info "Searching for project-pinned Node versions under: $WORKSPACE_ROOT"
+PROJECT_NODE_VERSIONS="$(mktemp)"
+
+if [[ -d "$WORKSPACE_ROOT" ]]; then
+  log_command "find $WORKSPACE_ROOT -maxdepth 6 -name .nvmrc -type f"
+  find "$WORKSPACE_ROOT" -maxdepth 6 -name .nvmrc -type f 2>/dev/null \
+    -exec zsh -c '
+      for f in "$@"; do
+        v="$(tr -d "[:space:]" < "$f")"
+        [[ -n "$v" ]] && print -- "$v	$f"
+      done
+    ' zsh {} + > "$PROJECT_NODE_VERSIONS" || true
+else
+  : > "$PROJECT_NODE_VERSIONS"
+fi
+
+if [[ -s "$PROJECT_NODE_VERSIONS" ]]; then
+  cat "$PROJECT_NODE_VERSIONS"
+else
+  print "No .nvmrc files found under workspace root."
+fi
+
+info "Fetching official Node.js release schedule"
+SCHEDULE_JSON="$(mktemp)"
+
+log_command "curl -fsSL https://raw.githubusercontent.com/nodejs/Release/main/schedule.json -o $SCHEDULE_JSON"
+curl -fsSL https://raw.githubusercontent.com/nodejs/Release/main/schedule.json \
+  -o "$SCHEDULE_JSON" || {
+    warn "Could not fetch Node.js release schedule."
+    warn "EOL-based removal suggestions will be skipped."
+    print "{}" > "$SCHEDULE_JSON"
+  }
+
+info "Building removable-version suggestions"
+
+REMOVE_COMMANDS_FILE="$(mktemp)"
+
+log_command "node - $SCHEDULE_JSON $PROJECT_NODE_VERSIONS $CURRENT_VERSION $DEFAULT_VERSION <installed-versions> $REMOVE_COMMANDS_FILE <<'NODE'"
+node - "$SCHEDULE_JSON" "$PROJECT_NODE_VERSIONS" "$CURRENT_VERSION" "$DEFAULT_VERSION" "$VERSIONS_RAW" "$REMOVE_COMMANDS_FILE" <<'NODE'
+const fs = require('fs');
+
+const [
+  scheduleFile,
+  projectFile,
+  currentVersion,
+  defaultVersion,
+  versionsRaw,
+  removeCommandsFile
+] = process.argv.slice(2);
+
+function parseVersion(v) {
+  const m = String(v).trim().replace(/^v/, '').match(/^(\d+)\.(\d+)\.(\d+)$/);
+  if (!m) return null;
+  return {
+    raw: `${m[1]}.${m[2]}.${m[3]}`,
+    major: Number(m[1]),
+    minor: Number(m[2]),
+    patch: Number(m[3])
+  };
+}
+
+function cmp(a, b) {
+  return a.major - b.major || a.minor - b.minor || a.patch - b.patch;
+}
+
+let schedule = {};
+try {
+  schedule = JSON.parse(fs.readFileSync(scheduleFile, 'utf8'));
+} catch {
+  schedule = {};
+}
+
+const installed = versionsRaw
+  .split(/\s+/)
+  .map(parseVersion)
+  .filter(Boolean)
+  .sort(cmp);
+
+const projectPins = new Set();
+
+try {
+  const lines = fs.readFileSync(projectFile, 'utf8').split(/\n/);
+
+  for (const line of lines) {
+    const raw = line.split(/\t/)[0]?.trim();
+    if (!raw) continue;
+
+    const parsed = parseVersion(raw);
+    if (parsed) {
+      projectPins.add(parsed.raw);
+      projectPins.add(`v${parsed.raw}`);
+    } else {
+      projectPins.add(raw);
+    }
+  }
+} catch {}
+
+const latestByMajor = new Map();
+
+for (const v of installed) {
+  const existing = latestByMajor.get(v.major);
+
+  if (!existing || cmp(v, existing) > 0) {
+    latestByMajor.set(v.major, v);
+  }
+}
+
+const today = new Date();
+const suggestions = [];
+
+for (const v of installed) {
+  const reasons = [];
+
+  if (v.raw === currentVersion) continue;
+  if (v.raw === defaultVersion) continue;
+  if (projectPins.has(v.raw) || projectPins.has(`v${v.raw}`)) continue;
+
+  const latestSameMajor = latestByMajor.get(v.major);
+
+  if (!latestSameMajor || latestSameMajor.raw === v.raw) continue;
+
+  reasons.push(`newer installed version exists for Node ${v.major}: v${latestSameMajor.raw}`);
+
+  const majorKey = `v${v.major}`;
+  const majorSchedule = schedule[majorKey];
+
+  if (majorSchedule && majorSchedule.end) {
+    const endDate = new Date(`${majorSchedule.end}T00:00:00Z`);
+
+    if (!Number.isNaN(endDate.getTime()) && endDate < today) {
+      reasons.push(`Node ${majorKey} is past official EOL date ${majorSchedule.end}`);
+    }
+  }
+
+  if (reasons.length) {
+    suggestions.push({
+      version: v.raw,
+      reasons,
+      command: `nvm uninstall ${v.raw}`
+    });
+  }
+}
+
+if (!suggestions.length) {
+  console.log("No removable old Node versions detected.");
+  fs.writeFileSync(removeCommandsFile, "");
+  process.exit(0);
+}
+
+console.log("The following installed Node versions are candidates for removal.");
+console.log("Keeping the latest installed version for each major line:");
+console.log("");
+
+const commands = [];
+
+for (const s of suggestions) {
+  console.log(`v${s.version}`);
+  for (const reason of s.reasons) {
+    console.log(`  - ${reason}`);
+  }
+  console.log(`  Command: ${s.command}`);
+  console.log("");
+
+  commands.push(s.command);
+}
+
+fs.writeFileSync(removeCommandsFile, commands.join("\n") + "\n");
+
+console.log("Skipped automatically:");
+console.log("  - current active version");
+console.log("  - default version");
+console.log("  - exact versions found in .nvmrc files under WORKSPACE_ROOT");
+console.log("  - latest installed version for each Node major line");
+NODE
+
+if [[ -s "$REMOVE_COMMANDS_FILE" ]]; then
+  info "Removal commands to execute if confirmed"
+  cat "$REMOVE_COMMANDS_FILE"
+
+  print
+  print -n "Execute these nvm uninstall commands now? [y/N] "
+  read -r REPLY
+
+  case "$REPLY" in
+    [yY]|[yY][eE][sS])
+      info "Removing selected old Node versions"
+
+      while IFS= read -r cmd; do
+        [[ -z "$cmd" ]] && continue
+        log_command "$cmd"
+        print "+ $cmd"
+
+        if [[ "$cmd" =~ '^nvm uninstall [0-9]+\.[0-9]+\.[0-9]+$' ]]; then
+          # Avoid eval even for internally generated commands. The command is
+          # validated as one exact nvm uninstall operation before execution.
+          run_cmd "$cmd" nvm uninstall "${cmd##* }"
+        else
+          die "refusing to execute unexpected removal command: $cmd"
+        fi
+      done < "$REMOVE_COMMANDS_FILE"
+      ;;
+    *)
+      print "Skipped removal."
+      ;;
+  esac
+else
+  print "No removal commands generated."
+fi
+
+cleanup_file "$SCHEDULE_JSON"
+cleanup_file "$PROJECT_NODE_VERSIONS"
+cleanup_file "$REMOVE_COMMANDS_FILE"
+cleanup_file "$INSTALL_ACTIONS_FILE"
+cleanup_file "$MAJOR_UPDATE_COMMANDS_FILE"
+cleanup_file "$LATEST_LTS_FILE"
+
+info "Clearing nvm cache"
+run_cmd "nvm cache clear" nvm cache clear
+
+info "Final installed Node versions"
+run_cmd_allow_failure "nvm ls" nvm ls
+
+print
+print "Done."
+log_info ""
+log_info "Done."

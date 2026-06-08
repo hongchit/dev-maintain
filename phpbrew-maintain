@@ -1,0 +1,840 @@
+#!/usr/bin/env zsh
+
+# phpbrew-maintain
+# Routine PHPBrew maintenance for Apple Silicon macOS + Homebrew.
+# Builds PHP on a temporary RAM disk, installs managed PECL extensions,
+# validates the new PHP, safely destroys the RAM disk, then optionally
+# removes the previous patch release of the same PHP branch.
+
+emulate -L zsh
+set -euo pipefail
+umask 077
+
+###############################################################################
+# User configuration
+###############################################################################
+
+# Recommended default: 4 GiB. Increase to 6 GiB if a build runs out of space.
+RAM_GIB=4
+
+# Extensions managed by this script. For an existing branch, only extensions
+# from this list that are enabled in the previous patch are installed. For a
+# newly adopted branch, DEFAULT_NEW_BRANCH_EXTENSIONS are installed.
+MANAGED_PECL_EXTENSIONS=(redis xdebug)
+DEFAULT_NEW_BRANCH_EXTENSIONS=(redis xdebug)
+
+# Homebrew formulae needed by the selected PHP build variants.
+DEPENDENCIES=(
+  phpbrew
+  autoconf
+  bison
+  bzip2
+  curl
+  gd
+  gettext
+  icu4c
+  libiconv
+  libpq
+  libxml2
+  libzip
+  oniguruma
+  openssl@3
+  pkgconf
+  readline
+  re2c
+  sqlite
+  zlib
+)
+
+PHPBREW_ROOT="${PHPBREW_ROOT:-$HOME/.phpbrew}"
+PHPBREW_HOME="${PHPBREW_HOME:-$HOME/.phpbrew}"
+STATE_DIR="$HOME/.cache/phpbrew-maintain"
+STATE_FILE="$STATE_DIR/ramdisk-state"
+MARKER_NAME=".phpbrew-maintain-marker"
+
+# Runtime state. RAM_DEV is dynamically assigned by macOS, such as /dev/disk7.
+RAM_DEV=""
+RAM_MOUNT=""
+RAM_LABEL=""
+RAM_TOKEN=""
+RAM_LINK=""
+RAM_READY=0
+CREATED_THIS_RUN=0
+BUILD_STARTED=0
+
+###############################################################################
+# Output and general helpers
+###############################################################################
+
+info() {
+  print
+  print -- "==> $*"
+}
+
+warn() {
+  print -u2 -- "WARNING: $*"
+}
+
+die() {
+  print -u2 -- "ERROR: $*"
+  exit 1
+}
+
+confirm() {
+  local prompt="$1"
+  local reply=""
+
+  read -r "reply?$prompt [y/N] "
+  [[ "$reply" == [yY] || "$reply" == [yY][eE][sS] ]]
+}
+
+require_command() {
+  command -v "$1" >/dev/null 2>&1 || die "Required command not found: $1"
+}
+
+load_phpbrew_shell() {
+  [[ -r "$PHPBREW_HOME/bashrc" ]] ||
+    die "PHPBrew shell configuration not found: $PHPBREW_HOME/bashrc"
+
+  # PHPBrew's shell integration may reference variables that are unset.
+  set +u
+  source "$PHPBREW_HOME/bashrc"
+  set -u
+
+  command -v phpbrew >/dev/null 2>&1 ||
+    die "phpbrew is unavailable after sourcing $PHPBREW_HOME/bashrc"
+}
+
+phpbrew_cmd() {
+  local rc=0
+
+  # PHPBrew's zsh integration may reference unset positional parameters.
+  set +u
+  phpbrew "$@" || rc=$?
+  set -u
+
+  return "$rc"
+}
+
+###############################################################################
+# State-file handling
+###############################################################################
+
+write_state() {
+  mkdir -p "$STATE_DIR"
+  chmod 700 "$STATE_DIR"
+
+  {
+    print -r -- "1"
+    print -r -- "$RAM_DEV"
+    print -r -- "$RAM_MOUNT"
+    print -r -- "$RAM_LABEL"
+    print -r -- "$RAM_TOKEN"
+    print -r -- "$RAM_LINK"
+    date +%s
+  } >| "$STATE_FILE"
+
+  chmod 600 "$STATE_FILE"
+}
+
+load_state() {
+  [[ -f "$STATE_FILE" ]] || die "No saved RAM-disk state was found."
+
+  local owner permissions
+  owner="$(stat -f '%Su' "$STATE_FILE")"
+  permissions="$(stat -f '%Lp' "$STATE_FILE")"
+
+  [[ "$owner" == "$USER" ]] ||
+    die "State file is owned by '$owner', not '$USER': $STATE_FILE"
+
+  # Accept 600 or a stricter equivalent. Reject group/other permissions.
+  (( (10#$permissions & 077) == 0 )) ||
+    die "State file permissions are too open ($permissions): $STATE_FILE"
+
+  local lines
+  lines=("${(@f)$(<"$STATE_FILE")}")
+
+  [[ "${lines[1]:-}" == "1" ]] || die "Unsupported or corrupt state-file version."
+  [[ ${#lines[@]} -ge 6 ]] || die "Incomplete RAM-disk state file: $STATE_FILE"
+
+  RAM_DEV="${lines[2]:-}"
+  RAM_MOUNT="${lines[3]:-}"
+  RAM_LABEL="${lines[4]:-}"
+  RAM_TOKEN="${lines[5]:-}"
+  RAM_LINK="${lines[6]:-}"
+  RAM_READY=1
+}
+
+clear_state() {
+  rm -f "$STATE_FILE"
+}
+
+###############################################################################
+# Safe RAM-disk handling
+###############################################################################
+
+remove_safe_build_link() {
+  [[ -n "$RAM_LINK" && -L "$RAM_LINK" ]] || return 0
+
+  local target
+  target="$(readlink "$RAM_LINK")"
+
+  if [[ "$target" == "$RAM_MOUNT"/build/php-* ]]; then
+    rm "$RAM_LINK"
+  else
+    warn "Refusing to remove unexpected symlink: $RAM_LINK -> $target"
+    return 1
+  fi
+}
+
+read_diskutil_plist_value() {
+  local plist_file="$1"
+  local key="$2"
+
+  /usr/libexec/PlistBuddy -c "Print :$key" "$plist_file" 2>/dev/null || true
+}
+
+validate_saved_ramdisk() {
+  [[ -n "$RAM_DEV" && -n "$RAM_MOUNT" && -n "$RAM_LABEL" && -n "$RAM_TOKEN" ]] ||
+    die "RAM-disk state is incomplete; refusing to detach anything."
+
+  if ! diskutil info "$RAM_DEV" >/dev/null 2>&1; then
+    warn "Saved device no longer exists: $RAM_DEV"
+    return 2
+  fi
+
+  local plist_file actual_mount actual_label marker_file marker_token
+  plist_file="$(mktemp -t phpbrew-maintain-diskinfo)"
+  diskutil info -plist "$RAM_DEV" >| "$plist_file"
+
+  actual_mount="$(read_diskutil_plist_value "$plist_file" MountPoint)"
+  actual_label="$(read_diskutil_plist_value "$plist_file" VolumeName)"
+  rm -f "$plist_file"
+
+  [[ "$actual_mount" == "$RAM_MOUNT" ]] || {
+    warn "Saved device mount point does not match."
+    warn "Expected: $RAM_MOUNT"
+    warn "Actual:   ${actual_mount:-not mounted}"
+    return 1
+  }
+
+  [[ "$actual_label" == "$RAM_LABEL" && "$actual_label" == phpbrew-ram-* ]] || {
+    warn "Saved device volume label does not match the expected PHPBrew RAM disk."
+    warn "Expected: $RAM_LABEL"
+    warn "Actual:   ${actual_label:-unknown}"
+    return 1
+  }
+
+  marker_file="$RAM_MOUNT/$MARKER_NAME"
+  [[ -f "$marker_file" ]] || {
+    warn "RAM-disk identity marker is missing: $marker_file"
+    return 1
+  }
+
+  marker_token="$(<"$marker_file")"
+  [[ "$marker_token" == "$RAM_TOKEN" ]] || {
+    warn "RAM-disk identity marker does not match the saved state."
+    return 1
+  }
+
+  return 0
+}
+
+destroy_ramdisk() {
+  local validation_rc=0
+
+  validate_saved_ramdisk || validation_rc=$?
+
+  if (( validation_rc == 2 )); then
+    # Common after a reboot: the RAM disk is gone, but its state file and
+    # build-directory symlink may remain.
+    remove_safe_build_link || true
+    clear_state
+    RAM_READY=0
+    warn "Removed stale state; no device was detached."
+    return 0
+  fi
+
+  (( validation_rc == 0 )) ||
+    die "RAM-disk validation failed; refusing to detach $RAM_DEV."
+
+  remove_safe_build_link
+
+  info "Destroying verified RAM disk: $RAM_DEV mounted at $RAM_MOUNT"
+  if ! hdiutil detach "$RAM_DEV" >/dev/null; then
+    warn "Normal detach failed."
+    if confirm "Force-detach the verified PHPBrew RAM disk?"; then
+      hdiutil detach -force "$RAM_DEV" >/dev/null
+    else
+      die "RAM disk remains mounted at $RAM_MOUNT"
+    fi
+  fi
+
+  clear_state
+  RAM_READY=0
+  RAM_DEV=""
+  RAM_MOUNT=""
+  RAM_LABEL=""
+  RAM_TOKEN=""
+  RAM_LINK=""
+}
+
+destroy_current_run_ramdisk_unchecked() {
+  # Used only when this same script process created the device and failed
+  # before a PHP build started. It never acts on a device loaded from state.
+  (( CREATED_THIS_RUN == 1 )) || return 0
+
+  remove_safe_build_link || true
+
+  if [[ -n "$RAM_DEV" ]] && diskutil info "$RAM_DEV" >/dev/null 2>&1; then
+    hdiutil detach "$RAM_DEV" >/dev/null 2>&1 ||
+      hdiutil detach -force "$RAM_DEV" >/dev/null 2>&1 || true
+  fi
+
+  clear_state
+  RAM_READY=0
+}
+
+create_ramdisk() {
+  [[ ! -e "$STATE_FILE" ]] ||
+    die "A saved RAM-disk state already exists. Run: phpbrew-maintain cleanup-ramdisk"
+
+  local requested_bytes physical_bytes sectors short_token attach_output
+  requested_bytes=$((RAM_GIB * 1024 * 1024 * 1024))
+  physical_bytes="$(sysctl -n hw.memsize)"
+
+  if (( requested_bytes * 2 > physical_bytes )); then
+    warn "The configured ${RAM_GIB} GiB RAM disk exceeds half of physical RAM."
+    confirm "Continue with this RAM-disk size?" || die "RAM-disk creation cancelled."
+  fi
+
+  sectors=$((requested_bytes / 512))
+  RAM_TOKEN="$(uuidgen | tr '[:upper:]' '[:lower:]')"
+  short_token="${RAM_TOKEN[1,8]}"
+  RAM_LABEL="phpbrew-ram-$short_token"
+  RAM_MOUNT="/Volumes/$RAM_LABEL"
+
+  info "Creating ${RAM_GIB} GiB RAM disk"
+  attach_output="$(hdiutil attach -nomount "ram://$sectors")"
+  RAM_DEV="$(print -r -- "$attach_output" | awk 'NR == 1 {print $1}')"
+
+  [[ "$RAM_DEV" == /dev/disk* ]] || die "Unexpected RAM-disk device: $RAM_DEV"
+
+  RAM_READY=1
+  CREATED_THIS_RUN=1
+  write_state
+
+  diskutil eraseVolume HFS+ "$RAM_LABEL" "$RAM_DEV" >/dev/null
+
+  [[ -d "$RAM_MOUNT" ]] || die "RAM disk did not mount at $RAM_MOUNT"
+
+  # Keep ownership disabled on this temporary volume. A user-created RAM disk
+  # should be writable without elevating the entire maintenance process.
+  # Do not use sudo here: root-owned build artifacts would break PHPBrew's
+  # per-user installation model.
+  [[ -w "$RAM_MOUNT" ]] || die "RAM-disk mount is not writable without sudo: $RAM_MOUNT"
+
+  print -rn -- "$RAM_TOKEN" >| "$RAM_MOUNT/$MARKER_NAME"
+  mkdir -p "$RAM_MOUNT/build"
+  write_state
+
+  print "Device: $RAM_DEV"
+  print "Mount:  $RAM_MOUNT"
+}
+
+on_exit() {
+  local rc=$?
+
+  if (( RAM_READY == 1 && rc != 0 )); then
+    if (( CREATED_THIS_RUN == 1 && BUILD_STARTED == 0 )); then
+      warn "Failure occurred before compilation began; removing this run's RAM disk."
+      destroy_current_run_ramdisk_unchecked
+    else
+      print -u2
+      warn "The operation failed after compilation began."
+      warn "The verified RAM disk has been preserved for build-log inspection."
+      print -u2 -- "  Device: ${RAM_DEV:-unknown}"
+      print -u2 -- "  Mount:  ${RAM_MOUNT:-unknown}"
+      print -u2 -- "  Cleanup: phpbrew-maintain cleanup-ramdisk"
+    fi
+  fi
+
+  return "$rc"
+}
+
+trap on_exit EXIT
+
+###############################################################################
+# Homebrew and build-environment checks
+###############################################################################
+
+check_architecture_and_prefix() {
+  local arch_name brew_prefix
+  arch_name="$(uname -m)"
+  brew_prefix="$(brew --prefix)"
+
+  print "Architecture:    $arch_name"
+  print "Homebrew prefix: $brew_prefix"
+
+  [[ "$arch_name" == "arm64" ]] ||
+    warn "This script is designed primarily for native Apple Silicon builds."
+
+  if [[ "$arch_name" == "arm64" && "$brew_prefix" != "/opt/homebrew" ]]; then
+    die "Expected native ARM Homebrew under /opt/homebrew; found $brew_prefix"
+  fi
+}
+
+check_dependencies() {
+  local missing=()
+  local formula
+
+  info "Checking Homebrew dependencies"
+
+  for formula in "${DEPENDENCIES[@]}"; do
+    if ! brew list --versions "$formula" >/dev/null 2>&1; then
+      missing+=("$formula")
+    fi
+  done
+
+  if (( ${#missing[@]} > 0 )); then
+    warn "Missing formulae: ${missing[*]}"
+    if confirm "Install the missing formulae now?"; then
+      brew install "${missing[@]}"
+    else
+      die "Required dependencies are missing."
+    fi
+  fi
+
+  local outdated
+  outdated="$(brew outdated "${DEPENDENCIES[@]}" 2>/dev/null || true)"
+  if [[ -n "$outdated" ]]; then
+    warn "Some build dependencies are outdated:"
+    print -- "$outdated"
+  else
+    print "Configured dependencies are installed and current."
+  fi
+
+  if brew list --versions openssl@1.1 >/dev/null 2>&1; then
+    warn "openssl@1.1 is still installed. Modern PHP 8.2+ builds should use openssl@3."
+    print "Installed dependants of openssl@1.1:"
+    brew uses --installed openssl@1.1 || true
+  fi
+}
+
+configure_build_environment() {
+  phpbrew_cmd lookup-prefix homebrew >/dev/null
+
+  export PATH="$(brew --prefix bison)/bin:$(brew --prefix libpq)/bin:$PATH"
+
+  local pkg_paths=(
+    "$(brew --prefix openssl@3)/lib/pkgconfig"
+    "$(brew --prefix curl)/lib/pkgconfig"
+    "$(brew --prefix icu4c)/lib/pkgconfig"
+    "$(brew --prefix libxml2)/lib/pkgconfig"
+    "$(brew --prefix libzip)/lib/pkgconfig"
+    "$(brew --prefix libpq)/lib/pkgconfig"
+  )
+
+  export PKG_CONFIG_PATH="${(j/:/)pkg_paths}${PKG_CONFIG_PATH:+:$PKG_CONFIG_PATH}"
+  export CPPFLAGS="-I$(brew --prefix openssl@3)/include -I$(brew --prefix icu4c)/include -I$(brew --prefix libxml2)/include -I$(brew --prefix libpq)/include${CPPFLAGS:+ $CPPFLAGS}"
+  export LDFLAGS="-L$(brew --prefix openssl@3)/lib -L$(brew --prefix icu4c)/lib -L$(brew --prefix libxml2)/lib -L$(brew --prefix libpq)/lib${LDFLAGS:+ $LDFLAGS}"
+}
+
+run_check() {
+  require_command brew
+  require_command diskutil
+  require_command hdiutil
+  require_command sysctl
+  require_command uuidgen
+  [[ -x /usr/libexec/PlistBuddy ]] || die "/usr/libexec/PlistBuddy is unavailable."
+
+  load_phpbrew_shell
+
+  info "Environment"
+  check_architecture_and_prefix
+
+  info "PHPBrew"
+  print "Executable: $(command -v phpbrew)"
+  phpbrew_cmd --version
+  brew list --versions phpbrew
+
+  check_dependencies
+  configure_build_environment
+
+  info "Homebrew diagnostics"
+  brew doctor || warn "Homebrew reported warnings; review them before compiling PHP."
+}
+
+###############################################################################
+# Status and PHP-version discovery
+###############################################################################
+
+show_extension_configs() {
+  local php_dir ini_file found
+
+  info "Extension configuration by installed PHP version"
+
+  for php_dir in "$PHPBREW_ROOT"/php/php-*(Nn/); do
+    print
+    print -- "${php_dir:t}"
+    found=0
+
+    for ini_file in "$php_dir"/var/db/*.ini(N); do
+      print -- "  - ${ini_file:t}"
+      found=1
+    done
+
+    (( found == 1 )) || print "  - no extension INI files found"
+  done
+}
+
+check_installed_php_health() {
+  local php_dir php_bin
+
+  info "Installed PHP health check"
+
+  for php_dir in "$PHPBREW_ROOT"/php/php-*(Nn/); do
+    php_bin="$php_dir/bin/php"
+
+    if [[ ! -x "$php_bin" ]]; then
+      warn "${php_dir:t}: PHP executable is missing."
+      continue
+    fi
+
+    if "$php_bin" -n -v >/dev/null 2>&1; then
+      print "OK core:       ${php_dir:t}"
+    else
+      warn "${php_dir:t}: core PHP failed with -n."
+    fi
+
+    if "$php_bin" -v >/dev/null 2>&1; then
+      print "OK configured: ${php_dir:t}"
+    else
+      warn "${php_dir:t}: failed while loading its configuration/extensions."
+    fi
+  done
+}
+
+run_status() {
+  load_phpbrew_shell
+
+  info "Updating PHP release metadata"
+  phpbrew_cmd update
+
+  info "Latest known patch releases"
+  phpbrew_cmd known | grep -E '^[0-9]+\.[0-9]+:' || true
+
+  info "Installed PHP versions"
+  phpbrew_cmd list
+
+  show_extension_configs
+  check_installed_php_health
+
+  if [[ -f "$STATE_FILE" ]]; then
+    warn "A saved RAM-disk state exists: $STATE_FILE"
+    print "Inspect or remove it with: phpbrew-maintain cleanup-ramdisk"
+  fi
+}
+
+###############################################################################
+# Upgrade helpers
+###############################################################################
+
+resolve_latest_patch() {
+  local branch="$1"
+  local version
+
+  version="$(
+    phpbrew_cmd known |
+      awk -v key="${branch}:" '$1 == key {gsub(/,/, "", $2); print $2; exit}'
+  )"
+
+  [[ -n "$version" ]] || die "Could not resolve the latest patch for PHP $branch."
+  print -r -- "$version"
+}
+
+find_latest_installed_patch() {
+  local branch="$1"
+  local matches
+  matches=("$PHPBREW_ROOT"/php/php-${branch}.*(Nn/))
+
+  (( ${#matches[@]} > 0 )) || return 1
+  print -r -- "${matches[-1]:t}"
+}
+
+select_extensions_for_upgrade() {
+  local old_build="$1"
+  local extension old_ini_dir
+  local selected=()
+  local unmanaged=()
+
+  if [[ -z "$old_build" ]]; then
+    print -l -- "${DEFAULT_NEW_BRANCH_EXTENSIONS[@]}"
+    return 0
+  fi
+
+  old_ini_dir="$PHPBREW_ROOT/php/$old_build/var/db"
+
+  for extension in "${MANAGED_PECL_EXTENSIONS[@]}"; do
+    if [[ -f "$old_ini_dir/$extension.ini" ]]; then
+      selected+=("$extension")
+    fi
+  done
+
+  local ini_file ini_name is_managed
+  for ini_file in "$old_ini_dir"/*.ini(N); do
+    ini_name="${ini_file:t:r}"
+    is_managed=0
+
+    for extension in "${MANAGED_PECL_EXTENSIONS[@]}"; do
+      [[ "$ini_name" == "$extension" ]] && is_managed=1
+    done
+
+    (( is_managed == 1 )) || unmanaged+=("${ini_file:t}")
+  done
+
+  if (( ${#unmanaged[@]} > 0 )); then
+    warn "The previous patch has unmanaged INI files that will not be cloned automatically:"
+    printf '  %s\n' "${unmanaged[@]}" >&2
+  fi
+
+  print -l -- "${selected[@]}"
+}
+
+prepare_standard_build_link() {
+  local version="$1"
+  local source_dir="$RAM_MOUNT/build/php-$version"
+  local expected_dir="$PHPBREW_ROOT/build/php-$version"
+
+  [[ -d "$source_dir" ]] ||
+    die "Expected PHP source directory was not found on the RAM disk: $source_dir"
+
+  mkdir -p "$PHPBREW_ROOT/build"
+
+  if [[ -e "$expected_dir" || -L "$expected_dir" ]]; then
+    warn "Existing standard build path found: $expected_dir"
+    if confirm "Remove it and replace it with the RAM-disk link?"; then
+      rm -rf "$expected_dir"
+    else
+      die "Cannot prepare PHPBrew extension build path."
+    fi
+  fi
+
+  ln -s "$source_dir" "$expected_dir"
+  RAM_LINK="$expected_dir"
+  write_state
+}
+
+install_extensions() {
+  local version="$1"
+  shift
+  local extensions=("$@")
+  local extension
+
+  if (( ${#extensions[@]} == 0 )); then
+    warn "No managed PECL extensions were selected for installation."
+    return 0
+  fi
+
+  info "Selecting PHP $version for extension installation"
+  phpbrew_cmd use "$version"
+
+  for extension in "${extensions[@]}"; do
+    info "Installing PECL extension: $extension"
+    phpbrew_cmd ext install "$extension" stable ||
+      die "Extension installation failed: $extension"
+  done
+}
+
+validate_new_php() {
+  local build_name="$1"
+  shift
+  local extensions=("$@")
+  local php_bin="$PHPBREW_ROOT/php/$build_name/bin/php"
+  local extension
+
+  info "Validating $build_name"
+
+  [[ -x "$php_bin" ]] || die "Installed PHP executable not found: $php_bin"
+
+  "$php_bin" -n -v
+  "$php_bin" -v
+  "$php_bin" --ini
+  "$php_bin" -m >/dev/null
+  "$php_bin" -r 'echo "OpenSSL: ", OPENSSL_VERSION_TEXT, PHP_EOL;'
+
+  for extension in "${extensions[@]}"; do
+    "$php_bin" -r "exit(extension_loaded('$extension') ? 0 : 1);" ||
+      die "Required extension is not loaded: $extension"
+    print "Extension loaded: $extension"
+  done
+}
+
+###############################################################################
+# Upgrade routine
+###############################################################################
+
+run_upgrade() {
+  local branch="$1"
+  local latest new_build old_build=""
+  local selected_extensions
+  local build_variants
+
+  [[ "$branch" =~ '^[0-9]+\.[0-9]+$' ]] ||
+    die "Specify a PHP branch such as 8.4 or 8.5."
+
+  require_command brew
+  require_command diskutil
+  require_command hdiutil
+  require_command sysctl
+  require_command uuidgen
+  [[ -x /usr/libexec/PlistBuddy ]] || die "/usr/libexec/PlistBuddy is unavailable."
+
+  load_phpbrew_shell
+  check_architecture_and_prefix
+  check_dependencies
+  configure_build_environment
+
+  info "Updating PHP release metadata"
+  phpbrew_cmd update
+
+  latest="$(resolve_latest_patch "$branch")"
+  new_build="php-$latest"
+  old_build="$(find_latest_installed_patch "$branch" || true)"
+  selected_extensions=("${(@f)$(select_extensions_for_upgrade "$old_build")}")
+
+  build_variants=(
+    +default
+    +dbs
+    +mb
+    +exif
+    +ftp
+    "+gd=$(brew --prefix gd)"
+    "+gettext=$(brew --prefix gettext)"
+    +iconv
+    +intl
+    "+zlib=$(brew --prefix zlib)"
+  )
+
+  print
+  print "Requested branch:      $branch"
+  print "Latest patch:          $latest"
+  print "Newest installed:      ${old_build:-none}"
+  print "RAM-disk size:         ${RAM_GIB} GiB"
+  print "Build variants:        ${build_variants[*]}"
+  print "Extensions to install: ${selected_extensions[*]:-none}"
+  print
+
+  if [[ "$old_build" == "$new_build" ]]; then
+    print "$new_build is already the newest installed patch."
+    validate_new_php "$new_build" "${selected_extensions[@]}"
+    return 0
+  fi
+
+  confirm "Compile and install $new_build?" || die "Upgrade cancelled."
+
+  create_ramdisk
+  BUILD_STARTED=1
+
+  info "Compiling $new_build on the RAM disk"
+  phpbrew_cmd install \
+    --build-dir "$RAM_MOUNT/build" \
+    -j "$(sysctl -n hw.logicalcpu)" \
+    "$latest" \
+    "${build_variants[@]}"
+
+  prepare_standard_build_link "$latest"
+  install_extensions "$latest" "${selected_extensions[@]}"
+  validate_new_php "$new_build" "${selected_extensions[@]}"
+
+  # The installed PHP and PECL extensions no longer need the source tree.
+  # Destroy the RAM disk before changing the default PHP or removing rollback.
+  destroy_ramdisk
+
+  info "Switching the default PHP to $new_build"
+  phpbrew_cmd switch "$new_build"
+
+  print
+  print "Successfully installed, validated, and selected $new_build."
+
+  if [[ -n "$old_build" && "$old_build" != "$new_build" ]]; then
+    print
+    warn "Previous patch remains installed as a rollback version: $old_build"
+    if confirm "Remove the previous patch $old_build now?"; then
+      phpbrew_cmd remove "$old_build"
+    else
+      print "Kept $old_build."
+    fi
+  fi
+
+  info "Installed PHP versions after maintenance"
+  phpbrew_cmd list
+}
+
+###############################################################################
+# Main command handling
+###############################################################################
+
+cleanup_saved_ramdisk() {
+  load_state
+  destroy_ramdisk
+}
+
+usage() {
+  cat <<'EOF'
+Usage:
+  phpbrew-maintain check
+  phpbrew-maintain status
+  phpbrew-maintain upgrade <major.minor>
+  phpbrew-maintain cleanup-ramdisk
+
+Typical Homebrew-maintenance routine:
+  brew update
+  brew upgrade
+  phpbrew-maintain check
+  phpbrew-maintain status
+  phpbrew-maintain upgrade 8.4
+  phpbrew-maintain upgrade 8.5
+
+Notes:
+  - Successful builds destroy the RAM disk automatically.
+  - Failed builds preserve the RAM disk and build logs for diagnosis.
+  - cleanup-ramdisk validates the device, mount, label, and unique marker
+    before detaching anything.
+EOF
+}
+
+# This is intentionally a per-user maintenance tool. Refuse root execution so
+# PHPBrew installations, extension files, caches, and state remain user-owned.
+if (( EUID == 0 )); then
+  die "Do not run phpbrew-maintain with sudo or as root. Run it as your normal user."
+fi
+
+action="${1:-}"
+
+case "$action" in
+  check)
+    run_check
+    ;;
+
+  status)
+    run_status
+    ;;
+
+  upgrade)
+    [[ $# -eq 2 ]] || {
+      usage
+      exit 2
+    }
+    run_upgrade "$2"
+    ;;
+
+  cleanup-ramdisk)
+    cleanup_saved_ramdisk
+    ;;
+
+  *)
+    usage
+    exit 2
+    ;;
+esac
